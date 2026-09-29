@@ -1,0 +1,17 @@
+// Komponen pembungkus layout utama: top bar di atas, konten di bawahnya.
+// Sidebar vertikal dan bottom nav sudah dihapus (perombakan 2026-09-29) — navigasi kini ada di TopBar,
+// sehingga konten mendapat lebar penuh; penting untuk tabel My List dan grid Browse.
+import type { ReactNode } from 'react'
+import { TopBar } from './TopBar'
+
+type AppShellProps = { children: ReactNode }
+
+// Dipakai layout route src/routes/_app.tsx, jadi halaman /login tampil tanpa shell ini
+export function AppShell({ children }: AppShellProps) {
+  return (
+    <div className="min-h-dvh bg-slate-950 text-slate-100">
+      <TopBar />
+      <main className="mx-auto w-full max-w-7xl px-4 py-6 md:px-8">{children}</main>
+    </div>
+  )
+}
