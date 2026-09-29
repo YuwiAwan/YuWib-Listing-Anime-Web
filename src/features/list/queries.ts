@@ -6,6 +6,7 @@ import { queryOptions, useMutation, useQuery, useQueryClient } from '@tanstack/r
 import { supabase } from '@/lib/supabase'
 import { useUser } from '@/features/auth/useSession'
 import type { AnimeSnapshot } from '@/features/anime/animeRow'
+import { syncAnime } from '@/features/anime/syncAnime'
 import type { Database } from '@/types/database.types'
 import { buildEntryPatch, today, type EntryChanges } from './entryPatch'
 import type { ListStatus } from './status'
@@ -51,9 +52,11 @@ export function useMyEntry(malId: number) {
 }
 
 // Tambahkan anime ke list. Dua langkah dalam satu mutation:
-//   1. upsert snapshot ke tabel `anime`  — supaya halaman List & Dashboard tidak perlu memanggil API sama sekali
-//   2. insert baris `list_entries`       — data personal (status, progress, skor)
+//   1. minta server menyimpan snapshot anime (Edge Function sync-anime) — supaya halaman List &
+//      Dashboard tidak perlu memanggil API. Browser tidak boleh menulis tabel `anime` langsung.
+//   2. insert baris `list_entries` — data personal (status, progress, skor)
 // Langkah 1 wajib lebih dulu karena list_entries.mal_id punya foreign key ke anime.mal_id.
+// `snapshot` tetap dikirim ke mutation ini karena jumlah episodenya dipakai saat status = completed.
 export function useAddToList() {
   const user = useUser()
   const queryClient = useQueryClient()
@@ -62,11 +65,8 @@ export function useAddToList() {
     mutationFn: async ({ snapshot, status }: { snapshot: AnimeSnapshot; status: ListStatus }) => {
       if (!user) throw new Error('Harus login untuk menambah ke list')
 
-      // cached_at diperbarui supaya kita tahu kapan snapshot ini terakhir disegarkan
-      const { error: animeError } = await supabase
-        .from('anime')
-        .upsert({ ...snapshot, cached_at: new Date().toISOString() }, { onConflict: 'mal_id' })
-      if (animeError) throw animeError
+      const sync = await syncAnime([snapshot.mal_id])
+      if (sync.failed.includes(snapshot.mal_id)) throw new Error('Data anime tidak bisa diambil. Coba lagi nanti.')
 
       const { data, error } = await supabase
         .from('list_entries')

@@ -46,8 +46,9 @@ Browser
 
 - **Search / browse / detail** → API anime langsung dari browser.
   Cache 24 jam di TanStack Query, persist ke IndexedDB supaya revisit tidak hit API lagi.
-- **Saat "tambah ke list"** → simpan snapshot (judul, poster, episode, tipe,
-  tahun, genre) ke tabel `anime`.
+- **Saat "tambah ke list"** → server menyimpan snapshot (judul, poster, episode, tipe,
+  tahun, genre) ke tabel `anime` lewat Edge Function `sync-anime`. Browser hanya
+  mengirim ID anime; datanya diambil server sendiri dari API (lihat §3, Keamanan).
 - **Halaman list & dashboard** → hanya baca Supabase. Nol request Jikan.
 - **Halaman detail** → Jikan (segar) + overlay `list_entries`. Refresh snapshot
   kalau `cached_at` > 7 hari atau anime masih airing (jumlah episode berubah).
@@ -133,10 +134,9 @@ alter table anime        enable row level security;
 alter table list_entries enable row level security;
 alter table profiles     enable row level security;
 
--- anime: bebas dibaca; ditulis dari browser (boleh selama single-user)
-create policy "anime readable" on anime for select using (true);
-create policy "anime writable" on anime for insert with check (auth.role() = 'authenticated');
-create policy "anime updatable" on anime for update using (auth.role() = 'authenticated');
+-- anime: bebas dibaca; TIDAK ADA policy tulis. Hanya Edge Function sync-anime
+-- (service role, melewati RLS) yang menulis. Lihat "Keamanan" di bawah.
+create policy "anime: readable by all" on anime for select using (true);
 
 -- list_entries: dipecah per operasi (bukan `for all`)
 create policy "select own" on list_entries for select using (auth.uid() = user_id);
@@ -151,6 +151,51 @@ create policy "update own profile" on profiles for update using (auth.uid() = id
 
 Plus trigger di `auth.users` untuk auto-insert `profiles` saat signup
 (pola standar Supabase), dan trigger `updated_at` di `list_entries`.
+
+### Keamanan (diperketat 2026-09-30, sebelum deploy)
+
+**Masalah awal.** Tabel `anime` dibaca bersama, tapi dulu setiap user login boleh
+insert/update baris mana saja. URL Supabase dan anon key memang terlihat di JavaScript,
+jadi siapa pun yang mendaftar bisa mengganti judul/poster anime untuk semua user lewat DevTools.
+
+**Solusi: Edge Function `sync-anime`** (`supabase/functions/sync-anime/`).
+- `POST { malIds: number[] }`, maksimal 25 ID, **wajib login** (`withSupabase({ auth: 'user' })`
+  dari `@supabase/server`; anonim & token palsu ditolak).
+- Server mengambil data dari Tenrai → Jikan sendiri, lalu upsert memakai service role.
+  Pemanggil hanya bisa memilih *anime mana*, tidak bisa menentukan *isinya*.
+- Melewati anime yang masih segar (1 hari untuk yang tayang, 7 hari untuk yang tamat),
+  jadi panggilan berulang tidak membebani API.
+- Jawaban: `{ synced, fresh, failed }`.
+- Mapper `snapshot.ts` di function **duplikat** dari `src/features/anime/animeRow.ts`
+  (Deno tidak bisa mengimpor alias `@/`). Keduanya sudah diuji identik pada 7 anime
+  berbeda (TV, movie "2 hr 4 min", masih tayang, durasi Unknown). Ubah keduanya bersamaan.
+- Dipanggil browser lewat `src/features/anime/syncAnime.ts` dari tiga tempat:
+  tambah ke list, penyegaran snapshot di halaman detail, dan impor MAL (per 25 ID).
+
+**Migration `20260930090000_lock_anime_writes.sql`:**
+- Menghapus policy insert/update tabel `anime` untuk user. Diuji: update/delete → 0 baris,
+  insert/upsert → `42501`, data tetap utuh.
+- Constraint `list_entries`: catatan ≤ 5000 karakter, rewatch 0–999, episode ≤ 100000.
+
+**Auth (`supabase/config.toml`):**
+- Password minimal 8 karakter, wajib huruf **dan** angka (`letters_digits`). Aturan ini
+  hanya untuk daftar & ganti password; akun lama tetap bisa masuk.
+- Konfirmasi email **dimatikan sementara** (`enable_confirmations = false`, keputusan 2026-09-30)
+  untuk fase tes bareng teman: akun langsung aktif, email tidak harus asli. Alasannya, pengirim
+  email bawaan Supabase cloud sangat terbatas tanpa SMTP sendiri, jadi email konfirmasi belum
+  tentu sampai. Konsekuensi: teman yang lupa password tidak bisa reset lewat email — reset
+  manual dari dashboard Supabase (Authentication → Users). Nyalakan lagi setelah SMTP (mis.
+  Resend) dipasang; kode form (tombol kirim ulang, pesan "cek email") sudah siap untuk itu.
+- `secure_password_change = true`.
+- Form daftar memvalidasi aturan password yang sama sebelum mengirim; error diterjemahkan
+  berdasarkan **kode** (`weak_password`, `email_not_confirmed`, …) — kode-kode ini diuji
+  langsung ke server. Ada tombol kirim ulang email konfirmasi (dibatasi rate limit server).
+- `emailRedirectTo` = `window.location.origin`, jadi tautan konfirmasi kembali ke situs
+  yang sedang dipakai (lokal maupun hasil deploy).
+
+**Catatan yang diterima:** pesan "Email ini sudah terdaftar" memberi tahu bahwa suatu
+email punya akun (account enumeration). Untuk tracker anime risikonya kecil dan pesan
+yang jelas lebih berguna; kalau nanti perlu, ganti jadi pesan umum "cek emailmu".
 
 ---
 
@@ -243,6 +288,9 @@ Trailer hanya memasang iframe YouTube setelah tombol putar ditekan; sebelum itu 
   — bukan `popularity`, karena anime tanpa peringkat bernilai 0 dan naik ke atas),
   terbaru (`order_by=start_date` + `end_date=hari ini` untuk menyaring anime yang belum tayang).
 - Genre Hentai (12) dan Erotica (49) disembunyikan dari chip: selalu 0 hasil karena `sfw=true`.
+- **Paginasi** bernomor (`1 … 5 [6] 7 … 42`) + kotak "Ke halaman" untuk melompat langsung.
+  Jumlah tombol selalu tetap (7) supaya posisinya tidak bergeser saat pindah halaman;
+  logikanya di `src/components/paginationRange.ts` (fungsi murni, sudah diuji).
 - Command palette (shadcn `Command`) untuk quick search dari mana saja — menyusul.
 
 ### `/stats`
@@ -333,6 +381,10 @@ Sidebar vertikal dan bottom nav **dihapus**; navigasi pindah ke top bar:
 - Kanan atas: avatar bulat → dropdown (Check Profile, Settings, Logout).
   Belum login → tautan "Login | Register".
 - Konten kini selebar `max-w-7xl` tanpa sidebar 240px — ruang lebih untuk tabel My List.
+- **Footer** (`src/app/SiteFooter.tsx`, ditambah 2026-09-30): logo, tagline, tautan media sosial,
+  dan "Dibuat oleh …". Semua isinya dari `src/app/siteInfo.ts`; tautan yang `href`-nya kosong
+  tidak ditampilkan. Ikon brand dari Simple Icons (CC0) karena Lucide sudah menghapus ikon brand;
+  path SVG-nya di-generate ke `src/components/socialIconPaths.ts` (tanpa dependency tambahan).
 
 ---
 
@@ -384,8 +436,22 @@ npx supabase gen types typescript --local > src/types/database.types.ts   # gene
 4. Selesai: `npx supabase stop` (data tidak hilang). Data hanya hilang lewat `supabase db reset`.
 
 - Migration ada di `supabase/migrations/*.sql`. Setiap perubahan skema = file migration baru, bukan edit file lama.
+- Edge Function ada di `supabase/functions/`. **Function BARU baru terlihat setelah
+  `supabase stop` + `supabase start`** (daftar function dibaca saat start). Mengedit function
+  yang sudah ada langsung terbaca tanpa restart.
+- Mengubah `supabase/config.toml` (mis. aturan auth) juga butuh stop + start.
 - Email konfirmasi lokal tidak benar-benar terkirim; lihat di Inbucket/Mailpit yang URL-nya muncul di `supabase status`.
-- Saat siap online: `npx supabase link --project-ref <ref>` lalu `npx supabase db push`.
+- Saat siap online:
+  ```
+  npx supabase link --project-ref <ref>
+  npx supabase db push                          # semua migration
+  npx supabase functions deploy sync-anime      # WAJIB: tanpa ini tambah-ke-list gagal
+  npx supabase config push                      # aturan auth dari config.toml ke cloud
+  ```
+  Lalu di dashboard → Authentication → URL Configuration: isi **Site URL** dan tambahkan
+  domain deploy ke **Redirect URLs** (untuk tautan konfirmasi email).
+  Setelah teman-teman selesai mendaftar, matikan sign-up (Authentication → Sign In / Providers
+  → Email → "Allow new users to sign up") supaya orang asing yang menemukan link tidak bisa ikut daftar.
 
 ---
 
@@ -399,9 +465,11 @@ Yang **belum** dikerjakan dan baru dikerjakan setelah versi personal selesai:
 
 - Buka sign-up + email confirmation + captcha.
 - `profiles.list_visibility`, halaman `/u/:username`, policy select publik.
-- **Pindahkan jalur tulis `anime` dari browser ke Edge Function `sync-anime`**
-  — wajib sebelum sign-up dibuka, karena saat ini user mana pun bisa menimpa
-  snapshot untuk semua orang.
+- ~~Pindahkan jalur tulis `anime` dari browser ke Edge Function `sync-anime`~~
+  ✅ Selesai 2026-09-30 (lihat §3, Keamanan).
+- Rate limit per user untuk `sync-anime`. Sekarang dibatasi 25 ID per panggilan dan
+  anime segar dilewati, tapi user bisa memanggil berulang dengan ID berbeda.
+- Captcha di form daftar (Supabase mendukung Turnstile/hCaptcha, butuh kunci dari penyedianya).
 - View publik `list_entries` tanpa kolom `notes`.
 - Moderasi review (report + `is_hidden`).
 - **Konten dewasa di profil publik.** Tabel `anime` dibaca bersama, jadi snapshot anime dewasa

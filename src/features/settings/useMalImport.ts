@@ -1,28 +1,27 @@
-// Menjalankan impor daftar MAL ke database. Bagian yang lambat adalah mengambil snapshot anime
-// dari API satu per satu (dibatasi rate limit), jadi prosesnya melaporkan progres dan
-// MELEWATI anime yang snapshot-nya sudah ada di tabel `anime`.
+// Menjalankan impor daftar MAL ke database, dalam dua tahap:
+//   1. snapshot anime disimpan SERVER lewat Edge Function sync-anime, per kelompok 25 ID.
+//      Server melewati anime yang sudah tersimpan & masih segar, jadi impor ulang hampir tanpa request API.
+//   2. entri list disimpan browser ke list_entries (dilindungi RLS: hanya milik user sendiri).
 import { useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { jikanToSnapshot, type AnimeSnapshot } from '@/features/anime/animeRow'
-import { apiFetch } from '@/features/anime/api'
+import { SYNC_BATCH_SIZE, syncAnime } from '@/features/anime/syncAnime'
 import { listEntriesKey } from '@/features/list/queries'
 import { supabase } from '@/lib/supabase'
-import type { JikanAnime, JikanResponse } from '@/types/jikan.types'
 import type { MalEntry } from './malImport'
 
 // Supabase menerima banyak baris sekaligus; 100 per permintaan cukup aman untuk ukuran payload
-const CHUNK = 100
+const ENTRY_CHUNK = 100
 
 export type ImportProgress = {
-  phase: 'idle' | 'checking' | 'fetching' | 'saving' | 'done' | 'error'
-  fetched: number // snapshot yang sudah diambil dari API
-  toFetch: number // snapshot yang perlu diambil (yang sudah ada di DB tidak dihitung)
+  phase: 'idle' | 'fetching' | 'saving' | 'done' | 'error'
+  processed: number // anime yang sudah diproses server (baik diambil baru maupun sudah ada)
+  total: number
   imported: number
   failed: { malId: number; title: string }[]
   message?: string
 }
 
-const IDLE: ImportProgress = { phase: 'idle', fetched: 0, toFetch: 0, imported: 0, failed: [] }
+const IDLE: ImportProgress = { phase: 'idle', processed: 0, total: 0, imported: 0, failed: [] }
 
 export function useMalImport() {
   const queryClient = useQueryClient()
@@ -34,51 +33,32 @@ export function useMalImport() {
 
   async function run(entries: MalEntry[], userId: string) {
     const update = (patch: Partial<ImportProgress>) => setProgress((prev) => ({ ...prev, ...patch }))
+    const titleById = new Map(entries.map((entry) => [entry.malId, entry.title]))
 
     try {
-      // 1. Cari anime yang snapshot-nya SUDAH ada, supaya tidak diambil ulang dari API.
-      //    Untuk impor kedua kalinya, langkah ini bisa memangkas hampir semua request.
-      update({ phase: 'checking', fetched: 0, toFetch: 0, imported: 0, failed: [] })
-      const malIds = entries.map((entry) => entry.malId)
-      const existing = new Set<number>()
-      for (let i = 0; i < malIds.length; i += CHUNK) {
-        const { data, error } = await supabase
-          .from('anime')
-          .select('mal_id')
-          .in('mal_id', malIds.slice(i, i + CHUNK))
-        if (error) throw error
-        for (const row of data) existing.add(row.mal_id)
-      }
+      // 1. Snapshot lewat server, per kelompok. Kelompok yang gagal total (mis. jaringan putus)
+      //    dicatat sebagai gagal semua, tapi tidak menghentikan kelompok berikutnya.
+      update({ phase: 'fetching', processed: 0, total: entries.length, imported: 0, failed: [] })
+      const failedIds = new Set<number>()
+      const ids = entries.map((entry) => entry.malId)
 
-      const missing = entries.filter((entry) => !existing.has(entry.malId))
-      update({ phase: 'fetching', toFetch: missing.length })
-
-      // 2. Ambil snapshot yang belum ada. apiFetch sudah mengantre sendiri sesuai rate limit,
-      //    jadi perulangan ini aman dijalankan berurutan tanpa penundaan manual.
-      const snapshots: AnimeSnapshot[] = []
-      const failed: ImportProgress['failed'] = []
-      for (const [index, entry] of missing.entries()) {
+      for (let i = 0; i < ids.length; i += SYNC_BATCH_SIZE) {
+        const batch = ids.slice(i, i + SYNC_BATCH_SIZE)
         try {
-          const res = await apiFetch<JikanResponse<JikanAnime>>(`/anime/${entry.malId}`)
-          snapshots.push(jikanToSnapshot(res.data))
+          const result = await syncAnime(batch)
+          result.failed.forEach((id) => failedIds.add(id))
         } catch {
-          // Anime yang sudah dihapus dari MAL tidak boleh menggagalkan seluruh impor
-          failed.push({ malId: entry.malId, title: entry.title })
+          batch.forEach((id) => failedIds.add(id))
         }
-        update({ fetched: index + 1, failed: [...failed] })
+        update({
+          processed: Math.min(i + SYNC_BATCH_SIZE, ids.length),
+          failed: [...failedIds].map((malId) => ({ malId, title: titleById.get(malId) ?? `#${malId}` })),
+        })
       }
 
-      // 3. Simpan snapshot, lalu entri list. Urutannya wajib: list_entries.mal_id
-      //    punya foreign key ke anime.mal_id.
+      // 2. Entri list — hanya untuk anime yang snapshot-nya berhasil tersimpan,
+      //    karena list_entries.mal_id punya foreign key ke anime.mal_id
       update({ phase: 'saving' })
-      for (let i = 0; i < snapshots.length; i += CHUNK) {
-        const { error } = await supabase
-          .from('anime')
-          .upsert(snapshots.slice(i, i + CHUNK), { onConflict: 'mal_id' })
-        if (error) throw error
-      }
-
-      const failedIds = new Set(failed.map((item) => item.malId))
       const rows = entries
         .filter((entry) => !failedIds.has(entry.malId))
         .map((entry) => ({
@@ -94,10 +74,10 @@ export function useMalImport() {
         }))
 
       // onConflict user_id,mal_id → impor ulang MEMPERBARUI entri yang sudah ada, bukan menggandakan
-      for (let i = 0; i < rows.length; i += CHUNK) {
+      for (let i = 0; i < rows.length; i += ENTRY_CHUNK) {
         const { error } = await supabase
           .from('list_entries')
-          .upsert(rows.slice(i, i + CHUNK), { onConflict: 'user_id,mal_id' })
+          .upsert(rows.slice(i, i + ENTRY_CHUNK), { onConflict: 'user_id,mal_id' })
         if (error) throw error
       }
 

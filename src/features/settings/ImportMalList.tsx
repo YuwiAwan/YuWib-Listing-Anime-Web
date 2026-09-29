@@ -32,7 +32,7 @@ export function ImportMalList() {
     }
   }
 
-  const busy = progress.phase === 'checking' || progress.phase === 'fetching' || progress.phase === 'saving'
+  const busy = progress.phase === 'fetching' || progress.phase === 'saving'
 
   return (
     <section className="space-y-4 rounded-xl border border-slate-800 bg-slate-900/60 p-5">
@@ -114,8 +114,8 @@ function Preview({
       </ul>
 
       <p className="text-xs text-slate-500">
-        Impor mengambil data judul & poster dari API untuk anime yang belum tersimpan. Batas laju API membuat
-        prosesnya sekitar 1 anime per 0,2 detik — biarkan halaman ini terbuka sampai selesai.
+        Server mengambil data judul & poster untuk anime yang belum tersimpan, 25 anime per kelompok.
+        Karena batas laju API, prosesnya sekitar 3 anime per detik — biarkan halaman ini terbuka sampai selesai.
       </p>
 
       <div className="flex gap-2">
@@ -136,7 +136,7 @@ function Progress({
   progress: ReturnType<typeof useMalImport>['progress']
   onDone: () => void
 }) {
-  const percent = progress.toFetch > 0 ? Math.round((progress.fetched / progress.toFetch) * 100) : 0
+  const percent = progress.total > 0 ? Math.round((progress.processed / progress.total) * 100) : 0
 
   if (progress.phase === 'error') {
     return (
@@ -173,11 +173,9 @@ function Progress({
   }
 
   const label =
-    progress.phase === 'checking'
-      ? 'Memeriksa anime yang sudah tersimpan…'
-      : progress.phase === 'fetching'
-        ? `Mengambil data anime ${progress.fetched} dari ${progress.toFetch}…`
-        : 'Menyimpan ke database…'
+    progress.phase === 'fetching'
+      ? `Menyiapkan data anime ${progress.processed} dari ${progress.total}…`
+      : 'Menyimpan ke database…'
 
   return (
     <div className="space-y-2 rounded-lg border border-slate-800 bg-slate-950/40 p-4">
@@ -185,7 +183,7 @@ function Progress({
         <Loader2 className="size-4 animate-spin text-blue-400" />
         {label}
       </p>
-      {progress.phase === 'fetching' && progress.toFetch > 0 && (
+      {progress.phase === 'fetching' && progress.total > 0 && (
         <div className="h-1.5 overflow-hidden rounded-full bg-slate-800">
           <div className="h-full rounded-full bg-blue-500 transition-all" style={{ width: `${percent}%` }} />
         </div>

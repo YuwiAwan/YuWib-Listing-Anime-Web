@@ -31,12 +31,23 @@ export const Route = createFileRoute('/login')({
   component: LoginPage,
 })
 
-// Skema validasi form. Password min 6 mengikuti minimum_password_length di supabase/config.toml
+// Skema form. Password di sini cukup "wajib diisi": aturan kekuatan password hanya berlaku saat
+// DAFTAR (lihat checkNewPassword). Kalau diterapkan saat masuk, akun lama yang dibuat sebelum aturan
+// diperketat tidak akan bisa login.
 const loginFormSchema = z.object({
   email: z.email('Format email tidak valid'),
-  password: z.string().min(6, 'Password minimal 6 karakter'),
+  password: z.string().min(1, 'Password wajib diisi'),
 })
 type LoginFormValues = z.infer<typeof loginFormSchema>
+
+// Aturan password akun baru — SAMA dengan supabase/config.toml (minimum_password_length = 8,
+// password_requirements = "letters_digits"). Server tetap menjadi penentu akhirnya; pengecekan di sini
+// hanya supaya user langsung tahu salahnya tanpa menunggu balasan server.
+function checkNewPassword(password: string): string | null {
+  if (password.length < 8) return 'Password minimal 8 karakter'
+  if (!/[a-zA-Z]/.test(password) || !/\d/.test(password)) return 'Password harus berisi huruf dan angka'
+  return null
+}
 
 type Mode = 'signin' | 'signup'
 
@@ -46,6 +57,8 @@ function LoginPage() {
   // ?mode= hanya menentukan tampilan AWAL; setelahnya tombol "Daftar/Masuk" yang mengatur, tanpa mengubah URL
   const [mode, setMode] = useState<Mode>(initialMode ?? 'signin')
   const [info, setInfo] = useState<string | null>(null)
+  // Email yang terakhir gagal masuk karena belum dikonfirmasi — untuk tombol "kirim ulang"
+  const [unconfirmedEmail, setUnconfirmedEmail] = useState<string | null>(null)
 
   const form = useForm<LoginFormValues>({
     resolver: zodResolver(loginFormSchema),
@@ -57,25 +70,56 @@ function LoginPage() {
   // Submit: panggil Supabase sesuai mode, tampilkan error di form, lalu navigasi kalau sukses
   const onSubmit = handleSubmit(async (values) => {
     setInfo(null)
+    setUnconfirmedEmail(null)
+
+    if (mode === 'signup') {
+      const problem = checkNewPassword(values.password)
+      if (problem) {
+        setError('password', { message: problem })
+        return
+      }
+    }
+
     const result =
       mode === 'signin'
         ? await supabase.auth.signInWithPassword(values)
-        : await supabase.auth.signUp(values)
+        : await supabase.auth.signUp({
+            ...values,
+            // Tautan di email konfirmasi mengarah kembali ke situs ini (lokal maupun setelah deploy).
+            // Alamat ini juga harus terdaftar di "Redirect URLs" Supabase, kalau tidak Supabase menolaknya.
+            options: { emailRedirectTo: `${window.location.origin}/` },
+          })
 
     if (result.error) {
-      setError('root', { message: translateAuthError(result.error.message) })
+      if (result.error.code === 'email_not_confirmed') setUnconfirmedEmail(values.email)
+      setError('root', { message: translateAuthError(result.error) })
       return
     }
 
-    // signUp tanpa sesi = project mewajibkan konfirmasi email (default di cloud; di lokal dimatikan)
+    // Daftar tanpa sesi = wajib konfirmasi email dulu (diaktifkan di supabase/config.toml)
     if (!result.data.session) {
-      setInfo('Akun dibuat. Cek email untuk konfirmasi, lalu masuk.')
+      setInfo(`Akun dibuat. Kami mengirim tautan konfirmasi ke ${values.email}. Buka tautan itu, lalu masuk.`)
       setMode('signin')
       return
     }
 
     navigate({ href: redirectTo ?? '/dashboard' })
   })
+
+  // Kirim ulang email konfirmasi untuk akun yang belum aktif. Dibatasi server (rate limit email),
+  // jadi tombol ini tidak bisa dipakai untuk membanjiri kotak masuk orang.
+  async function resendConfirmation() {
+    if (!unconfirmedEmail) return
+    const { error } = await supabase.auth.resend({
+      type: 'signup',
+      email: unconfirmedEmail,
+      options: { emailRedirectTo: `${window.location.origin}/` },
+    })
+    form.clearErrors('root')
+    if (error) setError('root', { message: translateAuthError(error) })
+    else setInfo(`Tautan konfirmasi dikirim ulang ke ${unconfirmedEmail}.`)
+    setUnconfirmedEmail(null)
+  }
 
   // Ganti mode Masuk ↔ Daftar tanpa mereset isian email
   function switchMode() {
@@ -110,14 +154,23 @@ function LoginPage() {
               autoComplete={mode === 'signin' ? 'current-password' : 'new-password'}
               {...register('password')}
             />
-            {errors.password && <p className="text-xs text-rose-400">{errors.password.message}</p>}
+            {errors.password ? (
+              <p className="text-xs text-rose-400">{errors.password.message}</p>
+            ) : (
+              mode === 'signup' && <p className="text-xs text-slate-500">Minimal 8 karakter, berisi huruf dan angka.</p>
+            )}
           </div>
 
           {/* Error dari server (email salah, sudah terdaftar, dsb.) ditaruh di errors.root */}
           {errors.root && (
-            <p className="rounded-md border border-rose-900 bg-rose-950/50 px-3 py-2 text-xs text-rose-300">
-              {errors.root.message}
-            </p>
+            <div className="space-y-1.5 rounded-md border border-rose-900 bg-rose-950/50 px-3 py-2 text-xs text-rose-300">
+              <p>{errors.root.message}</p>
+              {unconfirmedEmail && (
+                <button type="button" onClick={resendConfirmation} className="font-medium text-blue-400 hover:text-blue-300">
+                  Kirim ulang email konfirmasi
+                </button>
+              )}
+            </div>
           )}
           {info && (
             <p className="rounded-md border border-blue-900 bg-blue-950/50 px-3 py-2 text-xs text-blue-300">{info}</p>

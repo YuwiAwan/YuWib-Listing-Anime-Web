@@ -91,6 +91,6 @@ function AnimeDetailPage() {
 // dipanggil setelah itu.
 function PersonalPanel({ anime }: { anime: JikanAnime }) {
   // Sekalian segarkan snapshot di database dengan data yang baru saja diambil halaman ini
-  useRefreshSnapshot(anime)
+  useRefreshSnapshot(anime.mal_id)
   return <EntryEditor anime={anime} />
 }
